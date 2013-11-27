@@ -3,15 +3,47 @@
 
 from __future__ import unicode_literals, print_function
 
-
 import argparse
 import os
-import sys
 import re
+import sys
 
-from pprint import pprint
+if sys.version_info.major == 3:
+    print("Python 3.x is not supported (thanks to poster)")
+    sys.exit(1)
+
 from bitcasa import BitcasaClient
 from path import path
+from poster.encode import multipart_encode, MultipartParam, encode_and_quote
+from poster.streaminghttp import register_openers
+from pprint import pprint
+from urllib2 import urlopen
+from urllib2 import Request
+from urllib2 import HTTPError, URLError
+
+
+path_cache = {}
+
+
+class MultipartParamFixed(MultipartParam):
+
+    def __init__(self, *args, **kwargs):
+        super(MultipartParamFixed, self).__init__(*args, **kwargs)
+
+    def encode_hdr(self, boundary):
+        """Returns the header of the encoding of this parameter"""
+        boundary = encode_and_quote(boundary)
+
+        headers = ["--%s" % boundary]
+
+        disposition = 'form-data; name="file"; filename="%s"' % self.name
+
+        headers.append("Content-Disposition: %s" % disposition)
+
+        headers.append("")
+        headers.append("")
+
+        return "\r\n".join(headers)
 
 
 def wordlist_to_regex(words):
@@ -33,14 +65,21 @@ def filename_is_compliant(filename):
 
 
 def get_path(bitcasa, dst_path):
+
+    try:
+        return path_cache[dst_path]
+    except KeyError:
+        pass
+
     dst = path(dst_path)
     if not str(dst).startswith("/"):
         print("Destination name must be absolute.")
         print("/cats/dogs")
-        sys.exit(0)
+        sys.exit(1)
 
     bitcasa_path = "/"
     virtual_path = ""
+
     for d in dst.abspath().splitall():
         if str(d) == "/":
             continue
@@ -48,28 +87,46 @@ def get_path(bitcasa, dst_path):
             'folders' + bitcasa_path, data="folder_name=" + str(d))
         bitcasa_path = r.json()['result']['items'][0]['path']
         virtual_path += "/" + str(d)
-        print(virtual_path + " > " + bitcasa_path)
+        path_cache[virtual_path] = bitcasa_path
+        print("Get path {} > {}".format(virtual_path, bitcasa_path))
 
     return bitcasa_path
 
 
-def uplaod(bitcasa, src_path, dst_path):
+def upload_file(bitcasa, f, dst_path, r):
 
-    for f in src_path.listdir():
+    register_openers()
+
+    datagen, headers = multipart_encode(
+        [MultipartParamFixed(f.name, fileobj=f.open("rb"))])
+
+    url = "https://files.api.bitcasa.com/v1/files{}?access_token={}".format(get_path(bitcasa, dst_path), r.request.headers['Authorization'].split()[1])
+    request = Request(url, datagen, headers)
+    request.add_header('Authorization', r.request.headers['Authorization'])
+
+    try:
+        resp = urlopen(request)
+        print("Upload file OK {} > {}/{}".format(f, dst_path, f.name))
+    except (HTTPError, URLError) as e:
+        print("Upload file KO {} > {}/{}".format(f, dst_path, f.name))
+        pprint(e.__dict__)
+
+
+def upload(bitcasa, src_path, dst_path):
+
+    print("Upload {} > {}".format(src_path, dst_path))
+
+    r = bitcasa.get('folders/')
+
+    for f in src_path.abspath().listdir():
         if filename_is_compliant(f.name):
             if f.isfile():
-                with f.open() as fo:
-                    print("Upload {} in {} ".format(f, dst_path))
-                    r = bitcasa.put(
-                        'files' + dst_path, files={"file": (fo.name, fo)})
-                    pprint(r)
-
+                upload_file(bitcasa, f, dst_path, r)
             elif f.isdir():
-                print("Create {} in {} ".format(f, dst_path))
-                r = bitcasa.post(
-                    'folders' + dst_path, data="folder_name=" + f.name)
-                pprint(r)
-                uplaod(bitcasa, f, r.json()['result']['items'][0]['path'])
+                slash = "/" if not dst_path.abspath().endswith("/") else ""
+                remote = dst_path.abspath() + slash + f.name
+                print('Upload dir  > {}'.format(remote))
+                upload(bitcasa, f, remote)
             else:
                 print('Error {}'.format(f))
 
@@ -92,9 +149,9 @@ def main():
     args = parser.parse_args()
 
     src = path(args.src[0])
-    dst = get_path(bitcasa, path(args.dst[0]))
+    dst = path(args.dst[0])
 
-    uplaod(bitcasa, src, dst)
+    upload(bitcasa, src, dst)
 
 
 if __name__ == '__main__':
